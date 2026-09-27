@@ -2,6 +2,8 @@
 
 Agentic workflow runner and orchestrator based on the pi coding agent. 
 
+**Work In Progress - This project is still under development and not yet ready use!**
+
 ## Features
 
 * JS workflows instead of config files 
@@ -97,7 +99,7 @@ Setting fix value for `skip` or `next` is possible but most of the time we want 
 #### Sub Workflows
 
 A workflow can start a sub-workflow either synchronously or asynchronously. You can start a synchronous anonymous sub-workflow by simply adding a sub-array with new stages:
-```json
+```javascript
 import { CliRunner, doContent } from 'node-pi-flow'
 
 CliRunner.run([
@@ -109,7 +111,7 @@ CliRunner.run([
 ```
 If you want to start an asynchronous sub-workflow, you must use the `doWorkflow()`-function and pass a config with `async`-property to `true` or a string-id:
 
-```json
+```javascript
 import { CliRunner, doContent, doWorkflow, doAwait } from 'node-pi-flow'
 
 CliRunner.run([
