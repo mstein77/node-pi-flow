@@ -1,3 +1,5 @@
+import { createAbortError, WorkflowStatus } from "./workflow.ts"
+
 const skipPrefix = "@webpack-internal:///./"
 
 interface Console {
@@ -46,9 +48,9 @@ interface AbortableSleep {
 }
 
 const sleepWithSignal = (ms: number, signal: AbortSignal): Promise<boolean> => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         if (signal.aborted) {
-            resolve(false)
+            reject(createAbortError(signal.reason))
             return
         }
         const timeout = setTimeout(() => {
@@ -56,7 +58,7 @@ const sleepWithSignal = (ms: number, signal: AbortSignal): Promise<boolean> => {
         }, ms)
         signal.addEventListener("abort", () => {
             clearTimeout(timeout)
-            resolve(false)
+            reject(createAbortError(signal.reason))
         })
     })
 }
@@ -174,6 +176,15 @@ function createAbortController(timeoutMs?: number): AbortController {
     }
 }
 
+function createAutoReject(reject: (reason?: any) => void, time: TimeConfig | number): AbortController {
+    const ac = new AbortController()
+    const cancel = setTimeout(() => reject('Maximum time exceeded'), toTime(time))
+    ac.signal.addEventListener('abort', () => {
+        clearTimeout(cancel)
+    })
+    return ac
+}
+
 function withSign(value: string) {
     if (!value.length || ['0', '-'].includes(value[0])) return value
 
@@ -194,6 +205,10 @@ function getErrorMessage(error: any) {
     return typeof error === 'object' ? error.message : 'Unknown error'
 }
 
+function isProcessingStatus(status: WorkflowStatus) {
+    return ['running', 'awaiting'].includes(status)
+}
+
 export {
     createDump,
     createAbortController,
@@ -209,5 +224,7 @@ export {
     getReadableOffset,
     RunningPromise,
     createRunningPromise,
-    withSign
+    createAutoReject,
+    withSign,
+    isProcessingStatus
 }

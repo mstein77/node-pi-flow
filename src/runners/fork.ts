@@ -9,8 +9,10 @@ import {
     WorkflowResult,
     WorkflowRun
 } from "../core/workflow.ts"
-import { idToResolve, Messenger, createDownLinkMessageProcessor, AwaitMessage, UpLinkMessage, MessageWithoutTo } from "../core/messages.ts"
-import { createRandomId } from "../core/helper.ts"
+import {
+    Messenger, createDownLinkMessageProcessor, AwaitMessage, UpLinkMessage, MessageWithoutTo,
+    awaitNewResponse
+} from "../core/messages.ts"
 
 interface IpcMessenger extends Messenger {
     disconnect: () => void
@@ -33,7 +35,7 @@ class ForkRunner extends Runner {
         }
 
         const sendUplink = (message: UpLinkMessage) => {
-            if (process.send) {
+            if (process.connected && process.send) {
                 process.send(message)
             }
         }
@@ -45,28 +47,9 @@ class ForkRunner extends Runner {
             })
         }
 
-        const getResponseFromRootRun = async (message: AwaitMessage): Promise<string> => {
-            const awaitId = message.awaitId ?? createRandomId()
-            return new Promise<string>((resolve, reject) => {
-                if (!rootRunId) return reject('XXX No active root run given')
-
-                try {
-                    idToResolve.set(awaitId, resolve)
-                    sendUplink({
-                        ...message,
-                        awaitId,
-                        to: rootRunId
-                    })
-                } catch (e) {
-                    reject(e)
-                }
-            }).finally(
-                () => {
-                    idToResolve.delete(awaitId)
-                }
-            )
+        const getResponseFromRootRun = async (run: WorkflowRun, message: AwaitMessage): Promise<string> => {
+            return awaitNewResponse(message, sendToRootRun, run)
         }
-
         const messenger = {
             sendToParentRun: (message: MessageWithoutTo) => {
                 sendUplink({
@@ -99,12 +82,15 @@ class ForkRunner extends Runner {
             messenger: ForkRunner.messenger,
             sendUplinkMessage: ForkRunner.messenger.sendUplink,
             input: (run: WorkflowRun, type: InputType, options: Record<string, any> = {}): Promise<string> => {
-                return ForkRunner.messenger.getResponseFromRootRun({
-                    from: run.id,
-                    type: 'input',
-                    inputType: type,
-                    options
-                })
+                return ForkRunner.messenger.getResponseFromRootRun(
+                    run,
+                    {
+                        from: run.id,
+                        type: 'input',
+                        inputType: type,
+                        options
+                    }
+                )
             }
         })
     }

@@ -425,7 +425,7 @@ class CliRunner extends Runner {
             renderDelta: renderer.renderDelta,
             renderBlock: renderer.renderBlock,
             input: async (run: WorkflowRun, type: InputType, options: Record<string, any> = {}): Promise<string | void> => {
-                const { prompt } = options
+                const { prompt, signal = run.signal } = options
                 const parts = []
                 const details = {timestamp: Date.now()}
                 if (prompt) {
@@ -438,7 +438,7 @@ class CliRunner extends Runner {
                             run.handleBlockEvent('assistant', prompt, details)
                         }
                         run.handleBlockEvent('user', '', details)
-                        return getAbortableUserInput('', {signal: run.signal})
+                        return getAbortableUserInput('', { signal })
                     }
 
                     case 'select': {
@@ -466,7 +466,7 @@ class CliRunner extends Runner {
                         return getAbortableUserInput(
                             parts.join('\n') + '\n',
                             {
-                                signal: run.signal,
+                                signal,
                                 validate: (response: string) => {
                                     const parsed = Number.parseInt(response, 10)
                                     if (isNaN(parsed)) return false

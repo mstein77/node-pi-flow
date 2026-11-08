@@ -77,12 +77,14 @@ describe('Helper', () => {
         {
             const start = Date.now()
             const abortable = getAbortableSleep(1000)
-            await Promise.all([
-                abortable.promise,
-                sleep(100, async () => {
-                    await abortable.abort()
-                })
-            ])
+            try {
+                await Promise.all([
+                    abortable.promise,
+                    sleep(100, async () => {
+                        await abortable.abort()
+                    })
+                ])
+            } catch (e) {}
             expect((Date.now() - start) <= 250)
         }
     })

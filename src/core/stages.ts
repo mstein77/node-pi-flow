@@ -13,6 +13,7 @@ import { AgentConfig } from "./agent.ts"
 import { toTime, TimeConfig, sleepWithSignal } from './helper.ts'
 import type { ThinkingLevel } from "./../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/types.d.ts"
 import type { Model, Api } from "./../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/types.d.ts"
+import { ApiConfig } from "./http.ts"
 import {
     ExtensionFactory,
     LoadExtensionsResult,
@@ -168,6 +169,38 @@ function doText(configOrText: TextStageConfig | ValueOrFunc<Content> = {}) {
     return new TextStage(configOrText)
 }
 
+// Abort Stage
+
+interface AbortStageConfig extends StageConfig {
+    keys?: ValueOrFunc<string[] | string>
+}
+
+class AbortStage extends Stage {
+
+    protected config: AbortStageConfig
+
+    public constructor(config: AbortStageConfig) {
+        super('abort', config)
+        this.config = config
+    }
+
+    async exec(state: State, ctx: RunContext): Promise<any> {
+        let { keys = [] } = this.config
+        if (keys && typeof keys === 'function') keys = keys(state, ctx)
+
+        if (typeof keys === 'string') keys = [keys]
+
+        ctx.run.abortAndIgnorePendingStages(keys)
+    }
+}
+
+function doAbort(configOrKeys: string | string[] | AbortStageConfig = []): AbortStage {
+    if (typeof configOrKeys === 'string' || Array.isArray(configOrKeys)) {
+        configOrKeys = { keys: configOrKeys }
+    }
+    return new AbortStage(configOrKeys)
+}
+
 // Wait Stage
 
 interface WaitStageConfig extends StageConfig, TimeConfig {
@@ -282,6 +315,9 @@ class WorkflowStage extends Stage {
         }
         if (result.status === 'error') {
             throw Error(result.data.message)
+        }
+        if (result.status === 'aborted') {
+            ctx.run.abort(result.data.reason ?? 'Sub workflow was aborted')
         }
     }
 }
@@ -686,6 +722,9 @@ class ForkWorkflowStage extends Stage {
         if (result.status === 'error') {
             throw Error(result.data.message)
         }
+        if (result.status === 'aborted') {
+            ctx.run.abort(result.data.reason ?? 'Sub Workflow was aborted')
+        }
     }
 }
 
@@ -699,7 +738,7 @@ function doForkWorkflow(config: ForkWorkflowStageConfig | string): ForkWorkflowS
 // Connect Stage
 
 interface ConnectStateConfig extends StageConfig {
-    apis: Record<string, Record<string, any>>
+    apis: Record<string, ApiConfig>
 }
 
 class ConnectStage extends Stage {
@@ -712,45 +751,51 @@ class ConnectStage extends Stage {
     }
 
     public async exec(state: State, ctx: RunContext): Promise<any> {
+        const connects = []
         for (const [ apiId, apiConfig ] of Object.entries(this.config.apis)) {
-            const { type, url } = apiConfig
-            let sessionId: string | null = null
-            switch (type) {
-                case 'rest':
-                    const response = await fetch(
-                        url + '/connect',
-                        {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({foo: 'bares'})
+            connects.push(ctx.run.connectToApi(apiId, apiConfig))
+            /*
+                        let sessionId: string | null = null
+                        switch (type) {
+                            case 'rest':
+                                const response = await fetch(
+                                    url + '/connect',
+                                    {
+                                        method: 'POST',
+                                        headers: {
+                                            'Content-Type': 'application/json'
+                                        },
+                                        body: JSON.stringify({foo: 'bares'})
+                                    }
+                                )
+                                if (!response.ok || response.status !== 200) {
+                                    throw Error(`Could not connect to rest API ${apiId}`)
+                                }
+                                const body = await response.json()
+                                if (typeof body !== 'object' || body === null) {
+                                    throw Error(`Unexpected JSON response`)
+                                }
+                                sessionId = response.headers.get('x-reqtoken')
+                                break
+
+                            case 'socket':
+                                break
+
+                            default:
+                                throw Error(`Unknown API given!`)
                         }
-                    )
-                    if (!response.ok || response.status !== 200) {
-                        throw Error(`Could not connect to rest API ${apiId}`)
-                    }
-                    const body = await response.json()
-                    if (typeof body !== 'object' || body === null) {
-                        throw Error(`Unexpected JSON response`)
-                    }
-                    sessionId = response.headers.get('x-reqtoken')
-                    break
+                        if (sessionId) {
+                            ctx.run.markApiAsConnected(apiId, {
+                                url: url,
+                                type: 'rest',
+                                session: sessionId
+                            })
+                        }
 
-                case 'socket':
-                    break
-
-                default:
-                    throw Error(`Unknown API given!`)
-            }
-            if (sessionId) {
-                ctx.run.markApiAsConnected(apiId, {
-                    url: url,
-                    type: 'rest',
-                    session: sessionId
-                })
-            }
+                    }
+            */
         }
+        await Promise.all(connects)
     }
 }
 
@@ -819,6 +864,9 @@ class ApiWorkflowStage extends Stage {
         if (result.status === 'error') {
             throw Error(result.data.message)
         }
+        if (result.status === 'aborted') {
+            ctx.run.abort(result.data.reason ?? 'Api workflow was aborted')
+        }
     }
 }
 
@@ -885,6 +933,8 @@ Runner.dependencies = {
     doAwait,
     WaitStage,
     doWait,
+    AbortStage,
+    doAbort,
     ErrorStage,
     doError,
     CustomStage,
@@ -921,6 +971,8 @@ export {
     doAwait,
     WaitStage,
     doWait,
+    AbortStage,
+    doAbort,
     ErrorStage,
     doError,
     CustomStage,

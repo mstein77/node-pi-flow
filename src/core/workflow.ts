@@ -1,9 +1,17 @@
-import {ToolDefinition, getAgentDir, ModelRuntime, SessionManager} from "@earendil-works/pi-coding-agent"
+import { ToolDefinition, getAgentDir, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent"
 import type { ThinkingLevel } from "./../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/types.d.ts"
 import { Agent, AgentRegistry, AgentConfig, AbortableSession, ContentItem } from "./agent.ts"
 import { ModelTracker } from "./model.ts"
 import { BudgetManager, Metrics, createMetrics, DeltasAndValues } from "./metrics.ts"
-import { createAbortController, createRandomId, getReadableOffset, sleep, sleepWithSignal } from "./helper.ts"
+import {
+    isProcessingStatus,
+    createAbortController,
+    createAutoReject,
+    createRandomId,
+    getReadableOffset,
+    sleep,
+    sleepWithSignal
+} from "./helper.ts"
 import {
     createUpLinkMessageProcessor,
     MessageWithoutFromTo,
@@ -19,6 +27,7 @@ import {
     MessageStats,
     MessageStatus,
     MessageRegister,
+    MessageUnregister,
     UpLinkMessage
 } from "./messages.ts"
 import type { AssistantImages, ImagesInputContent, ImageContent, TextContent, ThinkingContent, ToolCall } from "./../../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/types.d.ts"
@@ -27,6 +36,7 @@ import { PersistenceConfigProps, createPersistenceHandler, PersistenceHandler, S
 import fs from "node:fs/promises"
 import { fork } from "node:child_process"
 import path from 'node:path'
+import { createApiConnection, ApiConfig, ApiConnection } from "./http.ts"
 
 import Debug from "debug"
 const runnerDebug = Debug("tyrolite:workflow:runner")
@@ -68,8 +78,8 @@ interface Abortable {
 
 class AbortError extends Error {}
 
-function createAbortError(reason = 'Aborted') {
-    return new AbortError(reason)
+function createAbortError(reason: string | DOMException = 'Aborted') {
+    return new AbortError(typeof reason === 'string' ? reason : reason.message)
 }
 
 const runOnce: AddEventListenerOptions = {once: true}
@@ -111,7 +121,7 @@ abstract class Stage {
         let abortHandler: () => void
         return new Promise(async (resolve, reject) => {
             abortHandler = (): void => {
-                reject(createAbortError(ctx.run.signal.reason))
+                reject(createAbortError(ctx.signal.reason))
             }
             try {
                 ctx.signal.addEventListener('abort', abortHandler, runOnce)
@@ -121,7 +131,8 @@ abstract class Stage {
                 reject(e)
             }
         }).finally(
-            async () => {
+            // TODO removed async here, everything okay?
+            () => {
                 if (abortHandler) ctx.signal.removeEventListener('abort', abortHandler, runOnce)
             }
         )
@@ -379,12 +390,6 @@ type BlockType = 'prompt' | 'session' | 'compaction' | 'response' | 'thinking'
 
 type WorkflowNode = [name: string, runId: string, parentRunId: string, level: number]
 
-interface ApiConnection {
-    url: string
-    type: 'rest' | 'socket'
-    session: string
-}
-
 interface RunConfig {
     showBlocks: number
     parentRunId?: string
@@ -393,6 +398,11 @@ interface RunConfig {
     engine?: StorageEngine
     sessionsDir?: string
     registry: WorkflowRegistry
+}
+
+interface StageAbortController {
+    asyncId?: string | true
+    abortController: AbortController
 }
 
 /**
@@ -416,7 +426,8 @@ class WorkflowRun {
     protected currIndex = 0
     protected pendingError: any
     public handlers: RunHandlers
-    protected pendingStages = new Set<AbortController>()
+    protected pendingStages = new Set<StageAbortController>()
+    protected ignoreAborts = new Set<StageAbortController>()
     protected asyncIds = new Set<string>()
     protected pendingAsyncIds = new Set<string>()
     protected remoteIdToStatus = new Map<string, WorkflowStatus>()
@@ -513,8 +524,8 @@ class WorkflowRun {
         return runIdToRun.has(id)
     }
 
-    public markApiAsConnected(apiId: string, connection: ApiConnection): void {
-        this.connected[apiId] = connection
+    public async connectToApi(apiId: string, config: ApiConfig): Promise<void> {
+        this.connected[apiId] = await createApiConnection(config)
     }
 
     public getChanges(): Record<string, ChangeItem[]> | undefined {
@@ -572,6 +583,10 @@ class WorkflowRun {
 
             case 'register':
                 target.registerRemoteRun(message)
+                break
+
+            case 'unregister':
+                target.unregisterRemoteRun(message)
                 break
 
             case 'model':
@@ -633,9 +648,19 @@ class WorkflowRun {
         this.setRemoteStatus(runId, status)
     }
 
-    protected registerRemoteRun(message: Pick<MessageRegister, 'runId'>) {
-        const { runId } = message
+    protected registerRemoteRun(message: Pick<MessageRegister, 'runId' | 'parent'>) {
+        const { runId, parent } = message
+        workflowTree.addNode(runId, parent)
         this.remoteRunToStatus.set(runId, 'ready')
+    }
+
+    protected unregisterRemoteRun(message: Pick<MessageUnregister, 'runId'>) {
+        const { runId } = message
+        const workflowIds = workflowTree.deleteSubtree(runId)
+        for (const id of workflowIds) {
+            const ac = originToInputAbort.get(id)
+            if (ac) ac.abort()
+        }
     }
 
     protected async registerWorkflow(message: Pick<MessageWorkflow, 'name' | 'runId' | 'parentRunId'>) {
@@ -830,7 +855,7 @@ class WorkflowRun {
     }
 
     public isProcessing(): boolean {
-        return ['running', 'awaiting'].includes(this.status)
+        return isProcessingStatus(this.status)
     }
 
     protected assertNotAborted() {
@@ -841,6 +866,36 @@ class WorkflowRun {
 
     get signal(): AbortSignal {
         return this.abortController.signal
+    }
+
+    protected setPendingErrorIfNew(error: unknown): boolean {
+        if (!this.pendingError && this.status !== 'completed') {
+            this.pendingError = error
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Aborts either all or a given list of pending stages and ignores their errors
+     */
+    public abortAndIgnorePendingStages(ids: (string)[] = []): void {
+        let controllers: StageAbortController[] = []
+        if (!ids.length) {
+            controllers = [...this.pendingStages.values()]
+        } else {
+            for (const controller of this.pendingStages.values()) {
+                if (typeof controller.asyncId !== 'string') continue
+
+                if (ids.includes(controller.asyncId)) {
+                    controllers.push(controller)
+                }
+            }
+        }
+        for (const controller of controllers) {
+            this.ignoreAborts.add(controller)
+            controller.abortController.abort('Aborted by workflow abort stage')
+        }
     }
 
     protected async process(args: Record<string, any>) :Promise<any> {
@@ -865,42 +920,39 @@ class WorkflowRun {
                 const asyncId = stage.isAsync()
                 if (asyncId !== false) {
                     const isStringId = typeof asyncId === 'string'
-                    const stageAbortController = createAbortController()
+                    // each asynchronous stages must be abortable
+                    const stageAbortController: StageAbortController = {
+                        asyncId,
+                        abortController: createAbortController()
+                    }
                     this.pendingStages.add(stageAbortController)
                     if (isStringId) {
                         this.asyncIds.add(asyncId)
                         this.pendingAsyncIds.add(asyncId)
                     }
-                    new Promise(async (resolve) => {
-                        let caughtError = null
-                        const signal = AbortSignal.any([
-                            this.signal,
-                            stageAbortController.signal
-                        ])
-                        try {
-                            await stage.doExec(state, {
-                                ...ctx,
-                                signal
-                            })
-                        } catch (e) {
-                            // async abort can be ignored
-                            if (typeof e === 'object' && e instanceof AbortError) {
-                                if (!this.pendingError) {
-                                    this.pendingError = e
-                                }
-                                resolve(undefined)
-                                return
+                    // trigger abort when run is aborted or the stage is aborted
+                    const signal = AbortSignal.any([
+                        this.signal,
+                        stageAbortController.abortController.signal
+                    ])
+                    let newError = false
+                    stage.doExec(state, {
+                        ...ctx,
+                        signal
+                    }).catch(
+                        e => {
+                            if (!this.ignoreAborts.has(stageAbortController)) {
+                                newError = this.setPendingErrorIfNew(e)
                             }
-                            caughtError = e
-                        } finally {
-                            this.pendingStages.delete(stageAbortController)
-                            if (isStringId) this.pendingAsyncIds.delete(asyncId)
                         }
-                        if (caughtError !== null)  {
-                            this.pendingError = caughtError
-                            this.abortController.abort()
+                    ).finally(async () => {
+                        this.pendingStages.delete(stageAbortController)
+                        this.ignoreAborts.delete(stageAbortController)
+                        if (isStringId) this.pendingAsyncIds.delete(asyncId)
+
+                        if (newError && !this.abortController.signal.aborted) {
+                            this.abortController.abort('Clean-up')
                         }
-                        resolve(undefined)
                     })
                 } else {
                     data = await stage.doExec(state, this.context)
@@ -926,17 +978,20 @@ class WorkflowRun {
             await this.setStatus('completed')
             result = data
         } catch (e) {
-            if (!this.pendingError) this.pendingError = e
+            this.setPendingErrorIfNew(e)
         } finally {
             if (this.isMainRun()) {
                 this.metrics.stopTimer('time-duration')
             }
             for (const stageAbortController of this.pendingStages.values()) {
-                stageAbortController.abort()
+                stageAbortController.abortController.abort('Clean-up')
             }
             await this.agentRegistry.abort()
             BudgetManager.stopRun(this)
         }
+        // async aborts triggered above might not have thrown yet
+        await sleep(0)
+
         if (this.pendingError) {
             const error = this.pendingError
             if (typeof error !== 'object' || !(error instanceof AbortError)) {
@@ -966,19 +1021,33 @@ class WorkflowRun {
     }
 
     public input(type: InputType, options: any = {}): Promise<string | void> {
-        const response = this.handlers.input(this, type, options)
+        const { from, ...subOptions } = options
+        let ac = from ? new AbortController() : undefined
+        const signal = ac ? AbortSignal.any([ac.signal, this.signal]) : this.signal
+        if (ac) {
+            originToInputAbort.set(from, ac)
+        }
+        const response = this.handlers.input(this, type, { ...subOptions, signal }).finally(
+            () => {
+                if (ac) originToInputAbort.delete(from)
+            }
+        )
         if (!response) throw Error(`User input type "${type}" is not supported by this runner`)
 
         return response
     }
 
     public async getAbortableUserInput(type: InputType, options: any = {}): Promise<string | void> {
+        const ac = createAutoReject(this.abort.bind(this), {m: 5})
         const abortableInput = this.input(type, options)
-
         const inputPromise = abortableInput.then(async (value) => {
             await this.setStatus('running')
             return value
-        })
+        }).finally(
+            () => {
+                ac.abort()
+            }
+        )
         await this.setStatus('awaiting')
         return inputPromise
     }
@@ -1018,7 +1087,7 @@ class WorkflowRun {
         }
     }
 
-    public getRemoteWorkflowResult(config: RemoteWorkflowConfig, args: Record<string, any> = {}) {
+    public async getRemoteWorkflowResult(config: RemoteWorkflowConfig, args: Record<string, any> = {}): Promise<void> {
         const { type, reject, workflow, resolve, run, signal } = config
         const runConfig = this.getRemoteRunnerConfig()
         try {
@@ -1066,104 +1135,72 @@ class WorkflowRun {
 
                 case 'api': {
                     const idx = workflow.indexOf(':')
-                    const api = workflow.slice(0, idx)
+                    const apiId = workflow.slice(0, idx)
                     const workflowId = workflow.slice(idx + 1)
                     if (!workflowId) {
                         throw Error(`No workflow id given`)
                     }
 
-                    const connection = this.connected[api]
-                    if (!connection) {
+                    const api = this.connected[apiId]
+                    if (!api) {
                         // TODO
                         throw Error(`No connection to API ${api}`)
                     }
-                    const { session, url } = connection
-
-                    fetch(
-                        `${url}/workflow/${workflowId}/start/${this.id}/${this.rootRunId}`,
+                    const body = await api.fetchJsonFromPath(
+                        `/workflow/${workflowId}/start/${this.id}/${this.rootRunId}`,
                         {
-                            method: 'POST',
                             body: JSON.stringify(args),
-                            signal,
-                            headers: {
-                                'Content-type': 'application/json',
-                                'X-ReqToken': session
-                            }
+                            signal
                         }
-                    ).then((response): Promise<unknown> => {
-                        if (!response.ok) {
-                            // TODO
-                            throw Error(`Invalid response`)
-                        }
-                        return response.json()
-                    }).then(async (body: unknown) => {
-                        if (typeof body !== 'object' || body === null || !('runId' in body)) {
-                            throw Error(`Unexpected response`)
-                        }
-                        const { runId } = body
-                        if (!runId) {
-                            throw Error(`No run id found in response`)
-                        }
+                    )
+                    if (typeof body !== 'object' || body === null || !('runId' in body)) {
+                        throw Error(`Invalid response JSON`)
+                    }
+                    const { runId } = body
 
-                        const sendDownLink = async (message: DownLinkMessage) => {
-                            const response = await fetch(
-                                `${url}/run/${this.id}/response`,
-                                {
-                                    method: 'POST',
-                                    body: JSON.stringify(message),
-                                    signal,
-                                    headers: {
-                                        'Content-type': 'application/json',
-                                        'X-ReqToken': session
-                                    }
-                                }
-                            )
-                            const responseBody = await response.json()
+                    const sendDownLink = async (message: DownLinkMessage) => {
+                        const response = await api.fetchJsonFromPath(
+                            `/run/${this.id}/response`,
+                            {
+                                body: JSON.stringify(message),
+                                signal
+                            }
+                        )
+                        if (typeof response !== 'object' || response === null || !('status' in response) || response.status !== 'ok') {
+                            reject(`Unexpected response received`)
                         }
-
-                        const controller: RemoteWorkflowController = {
-                            sendDownLink,
-                            kill: () => {
-                                // TODO ?
-                            },
-                            resolve,
-                            reject
+                    }
+                    const kill = () => {
+                        // api.fetchJsonFromPath(`/run/${runId}/abort`)
+                    }
+                    const controller: RemoteWorkflowController = {
+                        sendDownLink,
+                        kill,
+                        resolve,
+                        reject
+                    }
+                    signal.addEventListener('abort', kill)
+                    const processor = createUpLinkMessageProcessor(run, controller)
+                    let lastStatus = 'running'
+                    let lastResult: any
+                    do {
+                        await sleepWithSignal(1000, signal)
+                        const statusResponse = await api.fetchJsonFromPath(
+                            `/run/${runId}/status`,
+                            {
+                                signal
+                            }
+                        )
+                        const { status, messages, result } = statusResponse as { status: string, messages: UpLinkMessage[], result: any }
+                        for (const message of messages) {
+                            await processor(message)
                         }
-                        const processor = createUpLinkMessageProcessor(run, controller)
-                        let lastStatus = 'running'
-                        let lastResult: any
-                        do {
-                            await sleepWithSignal(1000, signal)
-                            const response = await fetch(
-                                `${url}/run/${runId}/status`,
-                                {
-                                    method: 'GET',
-                                    headers: {
-                                        'Content-type': 'application/json',
-                                        'X-ReqToken': session
-                                    },
-                                    signal
-                                }
-                            )
-                            if (!response.ok) {
-                                // TODO
-                                throw Error(`Unexpected http response code`)
-                            }
-                            const statusResponse: unknown = await response.json()
-                            if (typeof statusResponse !== 'object' || statusResponse === null) {
-                                // TODO
-                                throw Error(`Unexpected response`)
-                            }
-                            const { status, messages, result } = statusResponse as { status: string, messages: UpLinkMessage[], result: any }
-                            for (const message of messages) {
-                                await processor(message)
-                            }
-                            lastStatus = status
-                            lastResult = result
-                        } while (['running', 'awaiting'].includes(lastStatus))
+                        lastStatus = status
+                        lastResult = result
+                    } while (['running', 'awaiting'].includes(lastStatus))
 
-                        resolve(lastResult)
-                    })
+                    signal.removeEventListener('abort', kill)
+                    resolve(lastResult)
                     break
                 }
 
@@ -1412,6 +1449,76 @@ interface RunBindings {
     parentRunId?: string
 }
 
+interface TreeNode {
+    id: string
+    parent?: string
+    level: number
+}
+
+const originToInputAbort = new Map<string, AbortController>()
+
+class WorkflowTree {
+    protected nodes: TreeNode[] = []
+    protected runToLevel = new Map<string, number>()
+
+    registerRun(runner: Runner, run: WorkflowRun) {
+        this.addNode(run.id, runner.parentRunId)
+        if (runner.parentRunId && !run.mainRun.isKnownRunId(runner.parentRunId)) {
+            run.sendToRootRun({
+                type: 'register',
+                runId: run.id,
+                parent: runner.parentRunId
+            })
+        }
+    }
+
+    addNode(id: string, parent?: string) {
+        const level = (this.runToLevel.get(parent ?? '') ?? 0) + 1
+        this.nodes.push({
+            id,
+            parent,
+            level
+        })
+        this.runToLevel.set(id, level)
+    }
+
+    unregister(runner: Runner, run: WorkflowRun) {
+        this.deleteSubtree(run.id)
+        if (runner.parentRunId && !run.mainRun.isKnownRunId(runner.parentRunId)) {
+            run.sendToRootRun({
+                type: 'unregister',
+                runId: run.id,
+            })
+        }
+    }
+
+    deleteSubtree(id: string): string[] {
+        const index = this.nodes.findIndex(n => n.id === id)
+        const node = this.nodes[index]
+        if (!node) {
+            return []
+        }
+        const removed = [node.id]
+        const stack = [node.id]
+        let i = index + 1
+        const remaining = index === 0 ? [] : [...this.nodes.slice(0, index)]
+        while (i < this.nodes.length) {
+            const curr = this.nodes[i]
+            if (curr.parent && stack.includes(curr.parent)) {
+                stack.push(curr.id)
+                removed.push(curr.id)
+            } else {
+                remaining.push(curr)
+            }
+            i++
+        }
+        this.nodes = remaining
+        return removed
+    }
+}
+
+const workflowTree = new WorkflowTree()
+
 /**
  * A runner is used to execute workflows. We are distinguishing the following runner types
  *   - root runner
@@ -1449,6 +1556,7 @@ class Runner {
     protected _isAborted: boolean | string = false
     protected sessionsDir: string | undefined
     protected storageEngine?: StorageEngine
+
 
     // TODO rework these static methods:
 
@@ -1644,6 +1752,7 @@ class Runner {
             }
         }
         runIdToRun.delete(run.id)
+        workflowTree.unregister(this, run)
         runnerDebug(`${this.debugPrefix} Got workflow result in ${getReadableOffset(result.runtime)}:`, result)
         return result
     }
@@ -1668,6 +1777,7 @@ class Runner {
         const run = new WorkflowRun(runId, workflowOrId, this.getRunHandlers(runId, bindings), this.getRunConfig(bindings))
 
         this.idToRun.set(runId, run)
+        workflowTree.registerRun(this, run)
         return run
     }
 

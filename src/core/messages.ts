@@ -6,11 +6,10 @@ import {
     WorkflowStatus,
     InputType,
     Content,
-    BlockEventDetails, DeltaEvent, BlockType
+    BlockEventDetails, DeltaEvent, BlockType, createAbortError
 } from "./workflow.ts"
 import Debug from "debug"
-import { createRandomId } from "./helper.ts"
-import { getErrorMessage } from "./helper.ts"
+import { createRandomId, getErrorMessage, isProcessingStatus } from "./helper.ts"
 
 const debug = Debug('tyrolite:workflow:message')
 
@@ -21,6 +20,12 @@ interface BaseMessage {
 
 interface MessageRegister extends BaseMessage {
     type: 'register'
+    runId: string
+    parent: string
+}
+
+interface MessageUnregister extends BaseMessage {
+    type: 'unregister'
     runId: string
 }
 
@@ -93,7 +98,7 @@ interface MessageWorkflow extends BaseMessage {
     parentRunId?: string
 }
 
-type UpLinkMessage = MessageRegister | MessageResult | MessageStatus | Required<MessageInput> | MessageModel | MessageStats | MessageSystemPrompt | MessageBlock | MessageDelta | MessageError | MessageWorkflow | MessageSession
+type UpLinkMessage = MessageRegister | MessageUnregister | MessageResult | MessageStatus | Required<MessageInput> | MessageModel | MessageStats | MessageSystemPrompt | MessageBlock | MessageDelta | MessageError | MessageWorkflow | MessageSession
 
 type DistributiveOmit<T, K extends PropertyKey> =
     T extends unknown ? Omit<T, K> : never
@@ -105,7 +110,7 @@ type AwaitMessage = DistributiveOmit<MessageInput, 'to'>
 function isUpLinkMessage(message: any): message is UpLinkMessage {
     return typeof message === 'object'
         && ('type' in message)
-        && ['register', 'status', 'result', 'input', 'model', 'stats', 'systemPrompt', 'block', 'delta', 'error', 'workflow', 'session'].includes(message.type)
+        && ['register', 'unregister', 'status', 'result', 'input', 'model', 'stats', 'systemPrompt', 'block', 'delta', 'error', 'workflow', 'session'].includes(message.type)
 }
 
 function isAwaitMessage(message: Record<string, any>): message is AwaitMessage {
@@ -126,7 +131,13 @@ interface MessageAwaitResponse {
 
 type DownLinkMessage = MessageAwaitResponse
 
-const idToResolve = new Map<string, ((result: any) => void)>()
+interface AwaitController {
+    runId: string
+    resolve: (result: string) => void
+    reject: (err: unknown) => void
+}
+
+const idToResolve = new Map<string, AwaitController>()
 
 function createDownLinkMessageProcessor(messenger: Messenger, runner: Runner) {
     return (message: any) => {
@@ -139,11 +150,11 @@ function createDownLinkMessageProcessor(messenger: Messenger, runner: Runner) {
 
                 case 'awaitResponse':
                     const { awaitId, response } = message
-                    const resolve = idToResolve.get(awaitId)
-                    if (!resolve) {
+                    const awaitController = idToResolve.get(awaitId)
+                    if (!awaitController) {
                         throw Error(`Unknown awaitId "${awaitId}" given`)
                     }
-                    resolve(response)
+                    awaitController.resolve(response)
                     break
 
                 default:
@@ -177,13 +188,21 @@ function createUpLinkMessageProcessor(run: WorkflowRun, controller: RemoteWorkfl
             if (!isUpLinkMessage(message)) {
                 throw Error(`Expected UpLinkMessage but got invalid ${typeof message}`)
             }
+            if (message.type === 'status' && !isProcessingStatus(message.status)) {
+                for (const { reject } of idToResolve.values()) {
+                    reject(createAbortError('Source run aborted'))
+                }
+            }
+            if (message.type === 'register' || message.type === 'unregister') {
+                await run.handleMessage(run, message)
+            }
             if (!run.mainRun.isKnownRunId(message.to)) {
                 if (isAwaitMessage(message)) {
                     if (!run.messenger) {
                         throw Error(`No messenger available`)
                     }
                     const { awaitId } = message
-                    const response = await run.messenger.getResponseFromRootRun(message)
+                    const response = await run.messenger.getResponseFromRootRun(run, message)
                     sendDownLink({
                         type: 'awaitResponse',
                         awaitId,
@@ -192,7 +211,6 @@ function createUpLinkMessageProcessor(run: WorkflowRun, controller: RemoteWorkfl
                     return
                 }
                 run.mainRun.sendUplinkMessage(message)
-                // Messenger.sendUplink(message)
                 return
             }
             let targetRun: WorkflowRun | undefined = run
@@ -209,8 +227,8 @@ function createUpLinkMessageProcessor(run: WorkflowRun, controller: RemoteWorkfl
                 }
 
                 case 'input': {
-                    const { inputType, options, awaitId } = message
-                    const response = await targetRun.input(inputType, options)
+                    const { inputType, options, awaitId, from } = message
+                    const response = await targetRun.input(inputType, { from, ...options })
                     sendDownLink({
                         type: 'awaitResponse',
                         awaitId,
@@ -225,6 +243,9 @@ function createUpLinkMessageProcessor(run: WorkflowRun, controller: RemoteWorkfl
                 }
 
                 case 'register':
+                case 'unregister':
+                    break
+
                 case 'status':
                 case 'stats':
                 case 'model':
@@ -248,10 +269,44 @@ function createUpLinkMessageProcessor(run: WorkflowRun, controller: RemoteWorkfl
     }
 }
 
+const awaitNewResponse = async (message: AwaitMessage, sendToRootRun?: (message: UpLinkMessage | MessageWithoutTo) => void, run?: WorkflowRun): Promise<string> => {
+    const awaitId = message.awaitId ?? createRandomId()
+    let handler: () => void | undefined
+    const signal = run ? run.signal : undefined
+    return new Promise<string>((resolve: (value: string) => void, reject) => {
+        try {
+            if (signal) {
+                handler = reject
+                signal.addEventListener('abort', handler)
+            }
+            idToResolve.set(awaitId, {
+                runId: message.from,
+                resolve,
+                reject
+            })
+            if (sendToRootRun) {
+                sendToRootRun({
+                    ...message,
+                    awaitId
+                })
+            }
+        } catch (e) {
+            reject(e)
+        }
+    }).finally(
+        () => {
+            if (signal && handler) {
+                signal.removeEventListener('abort', handler)
+            }
+            idToResolve.delete(awaitId)
+        }
+    )
+}
+
 interface Messenger {
     sendToParentRun: (message: MessageWithoutTo) => void
     sendToRootRun: (message: MessageWithoutTo) => void
-    getResponseFromRootRun: (message: AwaitMessage) => Promise<string>
+    getResponseFromRootRun: (run: WorkflowRun, message: AwaitMessage) => Promise<string>
     sendUplink: (message: UpLinkMessage) => void
 }
 
@@ -259,6 +314,7 @@ export {
     idToResolve,
     Messenger,
     AwaitMessage,
+    awaitNewResponse,
     createUpLinkMessageProcessor,
     createDownLinkMessageProcessor,
     RemoteWorkflowController,
@@ -270,6 +326,7 @@ export {
     MessageResult,
     MessageSession,
     MessageRegister,
+    MessageUnregister,
     MessageSystemPrompt,
     MessageWorkflow,
     MessageBlock,

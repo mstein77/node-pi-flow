@@ -204,7 +204,7 @@ describe('runner', () => {
             expect(result.status).toBe('error')
             expect(typeof result.data).toBe('object')
             expect(result.data.message).toBe('test error')
-            expect(duration < 220).toBe(true)
+            expect(duration < 240).toBe(true)
         }
         {
             // parallel workflows

@@ -15,9 +15,16 @@ import {
 import express from "express"
 import http from "node:http"
 import { Request, Response, NextFunction } from 'express'
-import { createRandomId } from "../core/helper.ts"
+import {createAutoReject, createRandomId} from "../core/helper.ts"
 import bodyParser from "body-parser"
-import { AwaitMessage, idToResolve, MessageWithoutTo, Messenger, UpLinkMessage } from "../core/messages.ts"
+import {
+    AwaitMessage,
+    awaitNewResponse,
+    idToResolve,
+    MessageWithoutTo,
+    Messenger,
+    UpLinkMessage
+} from "../core/messages.ts"
 
 const DEFAULT_PORT = 8080
 const SESSION_HEADER_NAME = 'X-ReqToken'
@@ -114,11 +121,14 @@ class ApiRunner extends Runner {
             }
             const { type, awaitId, response } = req.body
             if (type !== 'awaitResponse' || !awaitId) {
-                throw Error(``)
+                throw Error(`Invalid message object`)
             }
             const resolve = idToResolve.get(awaitId)
             if (!resolve) {
-                throw Error(`No resolve found for awaitid "${awaitId}"`)
+                res.status(200).json({
+                    status: 'missing'
+                })
+                return
             }
             idToResolve.delete(awaitId)
             resolve(response)
@@ -246,15 +256,18 @@ class ApiRunner extends Runner {
                     }
                     messages.push(message)
                 }
+                const sendToRootRun = (message: MessageWithoutTo): void => {
+                    sendUplink({ ...message, to: rootRunId })
+                }
                 messenger = {
                     sendUplink,
-                    sendToRootRun: (message: MessageWithoutTo): void => {
-                        sendUplink({ ...message, to: rootRunId })
-                    },
+                    sendToRootRun,
                     sendToParentRun: (message: MessageWithoutTo): void => {
                         sendUplink({ ...message, to: parentRunId })
                     },
-                    getResponseFromRootRun: async (message: AwaitMessage): Promise<string> => {
+                    getResponseFromRootRun: async (run: WorkflowRun, message: AwaitMessage): Promise<string> => {
+                        return awaitNewResponse(message, sendToRootRun, run)
+                        /*
                         const awaitId = message.awaitId ?? createRandomId()
                         return new Promise<string>((resolve, reject) => {
                             if (!rootRunId) return reject('XXX No active root run given')
@@ -273,7 +286,7 @@ class ApiRunner extends Runner {
                                 idToResolve.delete(awaitId)
                             }
                         )
-
+                        */
                     }
                 }
             }
@@ -314,22 +327,29 @@ class ApiRunner extends Runner {
             messenger,
             input: async (run: WorkflowRun, type: InputType, options: Record<string, any> = {}): Promise<string | void> => {
                 if (!bindings) {
+                    // TODO use simple CLI input
                     throw Error('Not supported!')
                 }
-                if (messenger) {
-                    return messenger.getResponseFromRootRun({
-                        from: run.id,
-                        type: 'input',
-                        inputType: type,
-                        options
-                    })
+                // we have an API request with parent, so let the root run handle the input
+                const awaitMessage: AwaitMessage = {
+                    from: run.id,
+                    type: 'input',
+                    inputType: type,
+                    options
                 }
+                if (messenger) {
+                    return messenger.getResponseFromRootRun(run, awaitMessage)
+                }
+                // we have a session bound api request without a parent
                 const { session } = bindings
                 if (!session) {
-                    throw Error(`xy`)
+                    throw Error(`No valid session`)
                 }
-                const sessionDetails = this.sessionToDetails.get(session)
-                d('EXPECT SESSION', session)
+                const ac = createAutoReject(run.abort.bind(run), {s: 5})
+                return awaitNewResponse(awaitMessage, (message: MessageWithoutTo | UpLinkMessage) => {
+                }, run).finally(() => {
+                    ac.abort()
+                })
             },
             renderBlock,
             sendUplinkMessage: (message: UpLinkMessage) => {
